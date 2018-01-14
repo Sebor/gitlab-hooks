@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# Pre-receive hook for checking syntax and code style of puppet files. Place it into <reponame.git>/custom_hooks/
+# Don't forget to create dir /var/opt/gitlab/.puppetlabs with owner git
+# or use puppet in system PATH
+# Redirect all command output to /dev/null bacause of gitlab UI oneline MR field
+
+read oldrev newrev refname
+
+# Set branches
+parent_branch='production'
+current_branch=$(echo $refname | rev | cut -d / -f 1 | rev)
+
+# Run hook only for production branch
+#if [ $bname = 'production' ]; then
+
+    export PATH=/opt/gitlab/embedded/bin:$PATH
+    TEMPDIR=$(mktemp -d)
+
+    # Using these functions dont't allow to work gitlab UI oneline MR field properly
+    function header() { echo -e "\n${1}"; }
+    function fail() { echo -ne "${1}"; }
+    function pass() { echo -ne "${1}"; }
+    
+    function use_bundle() {
+      path_to_bundle=$(command -v bundle)
+      if [[ -x "$path_to_bundle" ]] && [[ -f Gemfile ]]; then
+        if "${path_to_bundle}" check ; then
+          return 0
+        else
+          fail "A bundler setup is present but incomplete. Run 'bundle install' or remove the Gemfile.\n"
+          exit 1
+        fi
+      else
+        return 1
+      fi
+    }
+    
+    function setup_paths() {
+      # Make sure the necessary tools are installed. If they aren't, just die and
+      # stop the commit. Force the use of these tools before a commit is allowed.
+      # No commit should ever happen without a puppet-lint check.
+    
+      path_to_puppet=$(command -v puppet)
+      if ! [[ -x "$path_to_puppet" ]]; then
+        header "The puppet binary wasn't found. Sorry, I won't allow you to commit without puppet installed."
+        fail "Please install puppet and try again.\n"
+        exit 1
+      fi
+    
+      path_to_puppet_lint=$(command -v puppet-lint)
+      if ! [[ -x "$path_to_puppet_lint" ]]; then
+        header "The puppet-lint binary wasn't found. Sorry, I won't allow you to commit without puppet-lint installed."
+        fail "Please install puppet-lint and try again.\n"
+        exit 1
+      fi
+    
+      path_to_erb=$(command -v erb)
+      if ! [[ -x "$path_to_erb" ]]; then
+        header "The erb binary wasn't found. Sorry, I won't allow you to commit without erb installed."
+        fail "Please install erb (Ruby Templating) and try again.\n"
+        exit 1
+      fi
+    
+      path_to_ruby=$(command -v ruby)
+      if ! [[ -x "$path_to_ruby" ]]; then
+        header "The ruby binary wasn't found. Sorry, I won't allow you to commit without ruby installed."
+        fail "Please install ruby and try again.\n"
+        exit 1
+      fi
+    
+      if use_bundle; then
+        path_to_puppet="${path_to_bundle} exec puppet"
+        path_to_puppet_lint="${path_to_bundle} exec puppet-lint"
+        path_to_erb="${path_to_bundle} exec erb"
+        path_to_ruby="${path_to_bundle} exec ruby"
+      fi
+    }
+    
+    function checkyaml() {
+      $path_to_ruby -e "require 'yaml'; YAML.load_file('$1')"
+    }
+    
+    setup_paths
+    
+
+    # Get the file names, without directory, of the files that have been modified
+    # between the new revision and the old revision or between the parent branch and the current branch (if new one pushed)
+    if [ $oldrev == "0000000000000000000000000000000000000000" ]; then
+        oldrev=$(git rev-list --boundary $newrev --not --all | sed -n 's/^-//p')
+    fi
+    
+    files=$(git --no-pager diff --name-only ${oldrev} ${newrev})
+
+    # Get a list of all objects in the new revision
+    objects=$(git ls-tree --full-name -r ${newrev})
+    
+    # Iterate over each of these files
+    for file in ${files}; do
+    
+        # Search for the file name in the list of all objects
+        object=$(echo -e "${objects}" | egrep "(\s)${file}\$" | awk '{ print $3 }')
+        
+        # If it's not present, then continue to the the next itteration
+        if [ -z ${object} ]; 
+        then 
+            continue; 
+        fi
+    
+        # Otherwise, create all the necessary sub directories in the new temp directory
+        mkdir -p "${TEMPDIR}/$(dirname ${file})" &>/dev/null
+        # and output the object content into it's original file name
+    git show ${newrev}:${file} > ${TEMPDIR}/${file}
+    
+    done;
+    
+    header "*** Checking puppet code style ***"
+    manifests=$(find ${TEMPDIR} -type f -name '*.pp')
+    for file in ${manifests}; do
+        if [[ -f $file && $file == *.pp ]]; then
+            $path_to_puppet_lint --error-level error --no-single_quote_string_with_variables-check --no-140chars-check --with-filename ${file}
+            if [[ $? -ne 0 ]]; then
+                fail "FAILED: "; echo "$file"
+                bad_file=1
+            fi
+        fi
+    done;
+    
+    header "*** Checking puppet manifest syntax ***"
+    manifests=$(find ${TEMPDIR} -type f -name '*.pp')
+    for file in ${manifests}; do
+        if [[ -f $file && $file == *.pp ]]; then
+            $path_to_puppet parser validate ${file}
+            if [[ $? -ne 0 ]]; then
+                fail "FAILED: "; echo "$file"
+                bad_file=1
+            fi
+        fi
+    done;
+    
+    header "*** Checking puppet template(epp) syntax ***"
+    templates=$(find ${TEMPDIR} -type f -name '*.epp')
+    for file in ${templates}; do
+        if [[ -f $file && $file == *.epp ]]; then
+            $path_to_puppet epp validate ${file}
+            if [[ $? -ne 0 ]];
+            then
+                fail "FAILED: "; echo "$file"
+                bad_file=1
+            fi
+        fi
+    done;
+    
+    header "*** Checking ruby template(erb) syntax ***"
+    templates=$(find ${TEMPDIR} -type f -name '*.erb')
+    for file in ${templates}; do
+        if [[ -f $file && $file == *.erb ]]; then
+            $path_to_erb -P -x -T '-' $file | ruby -c | grep -v '^Syntax OK'
+            if [[ "${PIPESTATUS[0]}" -ne 0 ]]; then
+                fail "FAILED: "; echo "$file"
+                bad_file=1
+            fi   
+        fi
+    done;
+    
+    header "*** Checking ruby syntax ***"
+    templates=$(find ${TEMPDIR} -type f -name '*.rb')
+    for file in ${templates}; do
+        if [[ -f $file && $file == *.rb ]]; then
+            $path_to_ruby -c $file | grep -v '^Syntax OK'
+            if [[ "${PIPESTATUS[0]}" -ne 0 ]]; then
+                fail "FAILED: "; echo "$file"
+                bad_file=1
+            fi   
+        fi
+    done;
+    
+    header "*** Checking YAML syntax ***"
+    templates=$(find ${TEMPDIR} -type f -name '*.yaml' -o -name '*.yml')
+    for file in ${templates}; do
+        if [[ -f $file ]]; then
+            checkyaml ${file}
+            if [[ $? -ne 0 ]];
+            then
+                fail "FAILED: "; echo "$file"
+                bad_file=1
+            fi
+        fi
+    done;
+    
+    rm -rf ${TEMPDIR} &> /dev/null
+    
+    if [[ $bad_file -eq 1 ]]
+    then
+      fail "\nErrors Found, Your Push REJECTED, noob!\n"
+      exit 1
+    fi
+
+#fi
+
